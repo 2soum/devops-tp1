@@ -40,4 +40,13 @@ class CarTest {
         String expected = "Car{plateNumber='ABC123', brand='Toyota', price=15000.0}";
         assertEquals(expected, car.toString());
     }
+
+    @Test
+    void testTwoCarsAreIndependent() {
+        Car car1 = new Car("ABC123", "Toyota", 15000.0);
+        Car car2 = new Car("XYZ789", "Honda", 20000.0);
+        car1.setPrice(99999.0);
+        assertEquals(20000.0, car2.getPrice());
+        assertEquals("XYZ789", car2.getPlateNumber());
+    }
 }
