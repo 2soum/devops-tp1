@@ -1,3 +1,13 @@
+# Pipeline en 4 jobs (inspire de remidesjardins/TP1_DevOps, adapte Gradle) :
+#
+#   CI-1 · Build        → compile + assemble, fail fast si le code ne compile pas
+#   CI-2 · Tests        → ./gradlew test jacocoTestReport, exporte build/ pour CI-3
+#   CI-3 · Qualite      → SonarCloud + Codecov a partir de build/ (sans re-executer les tests)
+#   CI-4 · Image Docker → build final multi-stage
+#
+# GitHub : Secrets requis = SONAR_TOKEN.
+# Codecov : upload tokenless (repo public), fail_ci_if_error=false.
+
 name: CI - Build, Test, Coverage & Quality
 
 on:
@@ -5,6 +15,10 @@ on:
     branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -14,12 +28,75 @@ permissions:
   actions: read
 
 jobs:
-  build-and-test:
+  # ---------------------------------------------------------------------------
+  # CI-1 — Compile sans tests (fail fast avant les jobs couteux)
+  # ---------------------------------------------------------------------------
+  build:
+    name: "CI-1 · Build (Gradle)"
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     steps:
-      - name: Checkout code
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Compile + assemble (sans tests)
+        run: |
+          chmod +x gradlew
+          ./gradlew clean assemble -x test --no-daemon
+
+  # ---------------------------------------------------------------------------
+  # CI-2 — Tests + JaCoCo, export de build/ pour reutilisation
+  # ---------------------------------------------------------------------------
+  test:
+    name: "CI-2 · Tests & Couverture (JaCoCo)"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Tests + rapport JaCoCo
+        run: |
+          chmod +x gradlew
+          ./gradlew test jacocoTestReport --no-daemon
+
+      - name: Artifact - rapport JaCoCo (HTML)
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: build/reports/jacoco/test/html
+          if-no-files-found: error
+
+      - name: Artifact - build/ complet (classes + jacoco.xml pour Sonar)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build
+          path: build
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # CI-3 — Sonar + Codecov : reutilise build/ (pas de re-execution des tests)
+  # ---------------------------------------------------------------------------
+  quality:
+    name: "CI-3 · Qualite (SonarCloud + Codecov)"
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (historique complet pour SCM Sonar)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -31,41 +108,46 @@ jobs:
           java-version: '21'
           cache: 'gradle'
 
-      - name: Run Tests with Coverage
-        run: |
-          chmod +x gradlew
-          ./gradlew test jacocoTestReport
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+      - name: Telecharger build/ de CI-2
+        uses: actions/download-artifact@v4
         with:
-          files: ./build/reports/jacoco/test/jacocoTestReport.xml
-          flags: unittests
-          name: codecov-umbrella
-          fail_ci_if_error: false
+          name: gradle-build
+          path: build
 
-      - name: Cache SonarQube packages
+      - name: Cache SonarCloud
         uses: actions/cache@v4
         with:
           path: ~/.sonar/cache
           key: ${{ runner.os }}-sonar
           restore-keys: ${{ runner.os }}-sonar
 
-      - name: Cache Gradle packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.gradle/caches
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
-          restore-keys: ${{ runner.os }}-gradle
-
-      - name: Build and analyze
+      - name: Analyse SonarCloud (sans re-executer les tests)
         env:
           SONAR_HOST_URL: https://sonarcloud.io
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           chmod +x gradlew
-          ./gradlew build sonar --info
+          ./gradlew sonar -x test -x jacocoTestReport --no-daemon --info
 
-      - name: Build Docker image
-        run: |
-          docker build -t myservice:latest .
+      - name: Upload couverture vers Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./build/reports/jacoco/test/jacocoTestReport.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+  # ---------------------------------------------------------------------------
+  # CI-4 — Image Docker finale (multi-stage)
+  # ---------------------------------------------------------------------------
+  docker:
+    name: "CI-4 · Image Docker"
+    needs: [test, quality]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image runtime
+        run: docker build -t myservice:latest .
